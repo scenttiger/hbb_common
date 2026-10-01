@@ -114,7 +114,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["193.108.114.201"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["connect.vega-it.ru"];
 pub const RS_PUB_KEY: &str = "FFvpND4XBbim4POri4obuUPJTQJ6w3lGwYfhoaiKz0g=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
