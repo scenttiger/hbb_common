@@ -60,16 +60,29 @@ lazy_static::lazy_static! {
 type Size = (i32, i32, i32, i32);
 type KeyPair = (Vec<u8>, Vec<u8>);
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AdditionalPasswordEntry {
+    pub alias: String,
+    pub salt: String,
+    pub storage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdditionalPasswordsStore {
+    pub passwords: Vec<AdditionalPasswordEntry>,
+}
+
 lazy_static::lazy_static! {
     static ref CONFIG: RwLock<Config> = RwLock::new(Config::load());
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
+    static ref ADDITIONAL_PASSWORDS: RwLock<AdditionalPasswordsStore> = RwLock::new(AdditionalPasswordsStore::load());
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
     static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
+    pub static ref APP_NAME: RwLock<String> = RwLock::new("VegaConnect".to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
@@ -114,8 +127,8 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+pub const RENDEZVOUS_SERVERS: &[&str] = &["connect.vega-it.ru"];
+pub const RS_PUB_KEY: &str = "FFvpND4XBbim4POri4obuUPJTQJ6w3lGwYfhoaiKz0g=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
@@ -1282,6 +1295,13 @@ impl Config {
         log::info!("id updated from {} to {}", id, new_id);
     }
 
+    /// Кодирует пароль в storage для дополнительного пароля.
+    /// Публичная обёртка над приватной encode_permanent_password_encrypted_storage_from_h1.
+    pub fn encode_additional_password_storage(password: &str, salt: &str) -> Option<String> {
+        let h1 = compute_permanent_password_h1(password, salt);
+        encode_permanent_password_encrypted_storage_from_h1(&h1)
+    }
+
     /// Sets the local permanent password.
     ///
     /// Returns `true` when the password is accepted or already matches the effective
@@ -1397,6 +1417,138 @@ impl Config {
             );
         }
         Self::has_usable_preset_password()
+    }
+
+    // ===== Additional passwords =====
+
+    /// Возвращает список дополнительных паролей.
+    pub fn get_additional_passwords() -> Vec<AdditionalPasswordEntry> {
+        ADDITIONAL_PASSWORDS.read().unwrap().passwords.clone()
+    }
+
+    /// Возвращает JSON всего хранилища (для синхронизации).
+    pub fn get_additional_passwords_json() -> String {
+        let store = ADDITIONAL_PASSWORDS.read().unwrap();
+        serde_json::to_string(&*store).unwrap_or_default()
+    }
+
+    /// Записывает JSON хранилища в локальный файл и кэш (при синхронизации).
+    pub fn write_local_additional_passwords(json: &str) -> crate::ResultType<()> {
+        let new_store: AdditionalPasswordsStore = serde_json::from_str(json)?;
+        new_store.save()?;
+        *ADDITIONAL_PASSWORDS.write().unwrap() = new_store;
+        Ok(())
+    }
+
+    /// Возвращает список псевдонимов.
+    pub fn list_additional_passwords() -> Vec<String> {
+        ADDITIONAL_PASSWORDS
+            .read()
+            .unwrap()
+            .passwords
+            .iter()
+            .map(|e| e.alias.clone())
+            .collect()
+    }
+
+    /// Добавляет дополнительный пароль.
+    pub fn add_additional_password(alias: &str, password: &str) -> bool {
+        let alias = alias.trim();
+        if alias.is_empty() || password.is_empty() {
+            log::warn!("add_additional_password: empty alias or password");
+            return false;
+        }
+
+        if Self::is_disable_change_permanent_password() {
+            log::warn!("Changing permanent password is disabled");
+            return false;
+        }
+
+        let (_native_storage, salt) = Self::get_local_permanent_password_storage_and_salt();
+        let salt = if salt.is_empty() {
+            let s = Self::get_salt();
+            log::info!("Generated salt for additional password");
+            s
+        } else {
+            salt
+        };
+
+        let storage = match Self::encode_additional_password_storage(password, &salt) {
+            Some(s) => s,
+            None => {
+                log::error!("Failed to encode additional password storage");
+                return false;
+            }
+        };
+
+        let mut store = ADDITIONAL_PASSWORDS.write().unwrap();
+        store.passwords.retain(|e| e.alias != alias);
+        store.passwords.push(AdditionalPasswordEntry {
+            alias: alias.to_owned(),
+            salt,
+            storage,
+        });
+
+        match store.save() {
+            Ok(_) => {
+                log::info!("Additional password '{}' saved", alias);
+                true
+            }
+            Err(err) => {
+                log::error!("Failed to save additional password: {err}");
+                false
+            }
+        }
+    }
+
+    /// Удаляет дополнительный пароль.
+    pub fn remove_additional_password(alias: &str) -> bool {
+        let mut store = ADDITIONAL_PASSWORDS.write().unwrap();
+        let len_before = store.passwords.len();
+        store.passwords.retain(|e| e.alias != alias);
+        if store.passwords.len() != len_before {
+            match store.save() {
+                Ok(_) => {
+                    log::info!("Additional password '{}' removed", alias);
+                    true
+                }
+                Err(err) => {
+                    log::error!("Failed to save after remove: {err}");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Проверяет, соответствует ли присланный клиентом хеш какому-либо дополнительному паролю.
+    /// `client_hash` — это SHA256(h1 + challenge), который прислал клиент.
+    /// `challenge` — текущий challenge сервера.
+    pub fn matches_additional_password_hash(client_hash: &[u8], challenge: &str) -> bool {
+        use crate::sha2::{Digest, Sha256};
+
+        let store = ADDITIONAL_PASSWORDS.read().unwrap();
+        for entry in &store.passwords {
+            if let Some(stored_h1) = decode_permanent_password_h1_from_storage(&entry.storage) {
+                let mut hasher = Sha256::new();
+                hasher.update(&stored_h1);
+                hasher.update(challenge.as_bytes());
+                let expected = hasher.finalize();
+
+                if expected.len() == client_hash.len() {
+                    let mut diff: u8 = 0;
+                    for (a, b) in expected.iter().zip(client_hash.iter()) {
+                        diff |= a ^ b;
+                    }
+                    if diff == 0 {
+                        log::info!("Matched additional password: {}", entry.alias);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn has_usable_preset_password() -> bool {
@@ -2711,6 +2863,44 @@ pub struct TrustedDevice {
     pub id: String,
     pub name: String,
     pub platform: String,
+}
+
+impl AdditionalPasswordsStore {
+    /// Путь к файлу с дополнительными паролями.
+    /// Лежит рядом с RustDesk.toml, путь определяется штатно через Config::path().
+    fn file_path() -> PathBuf {
+        Config::path("passwords.json")
+    }
+
+    /// Загружает хранилище с диска. Если файла нет — возвращает пустое.
+    pub fn load() -> Self {
+        let path = Self::file_path();
+        if !path.exists() {
+            return Self::default();
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(err) => {
+                log::error!("Failed to read passwords.json: {err}");
+                Self::default()
+            }
+        }
+    }
+
+    /// Сохраняет хранилище атомарно: пишем во временный файл, потом переименовываем.
+    pub fn save(&self) -> crate::ResultType<()> {
+        let path = Self::file_path();
+        let tmp = path.with_extension("json.tmp");
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
 }
 
 impl TrustedDevice {
